@@ -1,0 +1,6 @@
+vendor/
+*.coverprofile
+mocks/*
+main
+*.pb.go
+pxdbrc.*
