@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/directory"
@@ -28,37 +30,48 @@ var _ = Describe("FairQueueLayer", func() {
 		db = newDB
 		dir, err = directory.CreateOrOpen(db, []string{"test"}, nil)
 		Expect(err).NotTo(HaveOccurred())
+		_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			tx.ClearRange(fdb.KeyRange{fdb.Key(""), fdb.Key{0xFF}})
+			return nil, nil
+		})
+		Expect(err).NotTo(HaveOccurred())
 		layer = NewFairQueueLayer(dir.Sub())
 	})
 
 	AfterEach(func() {
-		db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-			tx.Clear(dir)
-			dir.Remove(tx, []string{})
+		_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			// tx.ClearRange(fdb.KeyRange{fdb.Key(""), fdb.Key{0xFF}})
 			return nil, nil
 		})
+		Expect(err).NotTo(HaveOccurred())
 	})
 
 	Describe("Push/Pop", func() {
 
-		data := QueueWork{
-			Priority:  1,
-			Tenant:    "A",
-			Partition: "x",
-		}
-
 		It("Works", func() {
+			data := QueueWork{
+				Priority:  1,
+				Tenant:    "A",
+				Partition: "x",
+			}
+			_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return nil, layer.Push(tx, &data)
+			})
+			Expect(err).NotTo(HaveOccurred())
 			out, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-				if err := layer.Push(tx, &data); err != nil {
-					return nil, err
-				}
 				return layer.Pop(tx, client1)
 			})
+			fmt.Println(out)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(out.(*QueueWork)).To(Equal(&data))
 		})
 
-		It("Returns nil when empty", func() {
+		It("Returns nil when all are locked", func() {
+			data := QueueWork{
+				Priority:  1,
+				Tenant:    "A",
+				Partition: "x",
+			}
 			out, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 				if err := layer.Push(tx, &data); err != nil {
 					return nil, err
@@ -70,6 +83,46 @@ var _ = Describe("FairQueueLayer", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(out.(*QueueWork)).To(BeNil())
+		})
+
+		It("Returns work after unlocking partition", func() {
+			data := QueueWork{
+				Priority:  1,
+				Tenant:    "A",
+				Partition: "x",
+			}
+			_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return nil, layer.Push(tx, &data)
+			})
+
+			Expect(err).NotTo(HaveOccurred())
+			_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return nil, layer.Push(tx, &data)
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			out, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return layer.Pop(tx, client1)
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal(&data))
+
+			out, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return layer.Pop(tx, client1)
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(BeNil())
+
+			_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return nil, layer.Commit(tx, &data)
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			out, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				return layer.Pop(tx, client1)
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal(&data))
 		})
 
 		Context("Many queue items", func() {
@@ -106,9 +159,9 @@ var _ = Describe("FairQueueLayer", func() {
 			}
 
 			It("Works", func() {
-				for _, data := range inputOrder {
+				for _, input := range inputOrder {
 					_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-						return nil, layer.Push(tx, &data)
+						return nil, layer.Push(tx, &input)
 					})
 					Expect(err).NotTo(HaveOccurred())
 				}
@@ -128,47 +181,67 @@ var _ = Describe("FairQueueLayer", func() {
 			})
 
 			Measure("Performance", func(b Benchmarker) {
-				producers := 10
-				consumers := 1
-				tenants := 5
-				priorities := 3
+				producers := 300
+				consumers := 100
+				tenants := 100
+				priorities := 10
 				partitions := 100
-				messages := 1000
+				messagesPerProducer := 10
+				messages := messagesPerProducer * producers
+				consumedMessages := uint64(0)
 				var wg sync.WaitGroup
 				wg.Add(producers)
-				wg.Add(consumers)
 				for i := 0; i < producers; i++ {
 					go func() {
-						messageCount := messages / producers
-						messages := make([]*QueueWork, messageCount)
-						for n := 0; n < messageCount; n++ {
-							messages[n] = generateData(tenants, priorities, partitions)
-						}
-						for _, message := range messages {
-							_, _ = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+						for i := 0; i < messagesPerProducer; i++ {
+							message := generateData(tenants, priorities, partitions)
+							_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 								return nil, layer.Push(tx, message)
 							})
+							Expect(err).NotTo(HaveOccurred())
 						}
 						wg.Done()
 					}()
 				}
-				for i := 0; i < consumers; i++ {
-					go func() {
-						clientID := fmt.Sprintf("client-%d", i)
-						for {
-							message, _ := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-								return layer.Pop(tx, clientID)
-							})
-							if message.(*QueueWork) == nil {
-								break
-							}
-						}
-						wg.Done()
-					}()
-				}
-				b.Time("process", func() {
+				b.Time("publish", func() {
 					wg.Wait()
 				})
+				wg.Add(consumers)
+				for i := 0; i < consumers; i++ {
+					clientID := fmt.Sprintf("client-%d", i)
+					go func() {
+						for {
+							count := atomic.LoadUint64(&consumedMessages)
+							fmt.Println(count)
+							if count == uint64(messages) {
+								break
+							}
+							message, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+								return layer.Pop(tx, clientID)
+							})
+							Expect(err).NotTo(HaveOccurred())
+							if message.(*QueueWork) == nil {
+								time.Sleep(100 * time.Millisecond)
+								continue
+							} else {
+								atomic.AddUint64(&consumedMessages, 1)
+							}
+							_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+								return nil, layer.Commit(tx, message.(*QueueWork))
+							})
+							Expect(err).NotTo(HaveOccurred())
+						}
+						wg.Done()
+					}()
+				}
+				b.Time("consume", func() {
+					wg.Wait()
+				})
+				message, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+					return layer.Pop(tx, "end")
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(message.(*QueueWork)).To(BeNil())
 			}, 1)
 		})
 	})
